@@ -1,0 +1,135 @@
+name: Build fscan (Obfuscated)
+
+on:
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.22"
+
+jobs:
+  build:
+    name: ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            bin_ext: .exe
+          - goos: linux
+            goarch: amd64
+            bin_ext: ""
+          - goos: linux
+            goarch: arm64
+            bin_ext: ""
+          - goos: darwin
+            goarch: amd64
+            bin_ext: ""
+          - goos: darwin
+            goarch: arm64
+            bin_ext: ""
+
+    steps:
+      - name: Checkout fscan source
+        uses: actions/checkout@v4
+        with:
+          repository: shadow1ng/fscan
+          ref: main
+          path: fscan
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install garble (Go obfuscator)
+        run: go install mvdan.cc/garble@latest
+
+      - name: Patch source — strip fscan fingerprints
+        run: |
+          cd fscan
+          python3 << 'PYEOF'
+          import os
+
+          def patch_file(path, replacements):
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+              for old, new in replacements:
+                  if old not in content:
+                      print(f"WARNING: pattern not found in {path}: {old[:60]}...")
+                  content = content.replace(old, new)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+
+          # 1. Disable Banner() call in parseCommandLineArgs (common/flag.go)
+          patch_file("common/flag.go", [
+              ("\t// 显示Banner\n\tBanner()",
+               "\t// Banner stripped for build\n"),
+          ])
+
+          # 2. Replace default User-Agent fingerprint (common/flag_config.go)
+          patch_file("common/flag_config.go", [
+              ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+               'curl/7.68.0'),
+          ])
+
+          # 3. Strip debug/pprof import from main_cli.go
+          patch_file("main_cli.go", [
+              ('\t"github.com/shadow1ng/fscan/common/debug"\n', ""),
+              ('\tdebug.Start()\n', ""),
+              ('\tdefer debug.Stop()\n', ""),
+          ])
+
+          print("Source patching complete.")
+          PYEOF
+
+      - name: Build with garble (obfuscated Go binary)
+        run: |
+          mkdir -p output
+          cd fscan
+          CGO_ENABLED=0 \
+          GOOS=${{ matrix.goos }} \
+          GOARCH=${{ matrix.goarch }} \
+          garble \
+            -tiny \
+            -literals \
+            -seed=random \
+            build \
+            -ldflags="-s -w -X 'github.com/shadow1ng/fscan/common.version=1.0' -X 'github.com/shadow1ng/fscan/common.commit=00000000' -X 'github.com/shadow1ng/fscan/common.date=1970-01-01'" \
+            -trimpath \
+            -buildvcs=false \
+            -o ../output/network_tool${{ matrix.bin_ext }} \
+            .
+
+      - name: UPX compress
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          version: latest
+          files: |
+            output/network_tool${{ matrix.bin_ext }}
+          args: --best --lzma
+
+      - name: Rename with platform suffix
+        run: |
+          mv output/network_tool${{ matrix.bin_ext }} output/network_tool-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.bin_ext }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fscan-files-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: output/network_tool-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.bin_ext }}
+          if-no-files-found: error
+          retention-days: 7
+
+  summary:
+    name: Build summary
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Done
+        run: |
+          echo "========================================="
+          echo "  All fscan builds completed."
+          echo "  Check 'Artifacts' section to download."
+          echo "========================================="
