@@ -156,13 +156,15 @@ jobs:
       - name: Strip Go build ID/note sections
         shell: bash
         run: |
+          set +e
           BIN="../output/network_tool${{ matrix.bin_ext }}"
           go tool buildid -w "$BIN" 2>/dev/null || true
 
-          if [ "${{ matrix.goos }}" = "linux" ]; then
+          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" = "amd64" ]; then
             strip -R .note.go.buildid "$BIN" 2>/dev/null || true
             strip -R .note.gnu.build-id "$BIN" 2>/dev/null || true
           fi
+          set -e
 
       - name: UPX compress
         uses: crazy-max/ghaction-upx@v3
