@@ -130,6 +130,7 @@ jobs:
       - name: Build binary
         run: |
           mkdir -p ../output
+          set +e
           GARBLE="$(go env GOPATH)/bin/garble"
           BIN="../output/network_tool${{ matrix.bin_ext }}"
           LDFLAGS="-s -w -X github.com/net/tools/common.version=1.0 -X github.com/net/tools/common.commit=00000000 -X github.com/net/tools/common.date=1970-01-01"
@@ -139,15 +140,22 @@ jobs:
             GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
               "$GARBLE" -tiny -literals -seed=random \
               build -ldflags="$LDFLAGS" -trimpath -buildvcs=false \
-              -o "$BIN" . 2>&1 || echo "GARBLE_FAILED"
+              -o "$BIN" .
+            GARBLE_RC=$?
+            echo "garble exit: $GARBLE_RC"
           fi
 
           if [ ! -f "$BIN" ]; then
-            echo "=== fallback go build ==="
+            echo "=== go build fallback ==="
             GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
               go build -ldflags="$LDFLAGS" -trimpath -buildvcs=false \
-              -gcflags="all=-spectre=index" \
               -o "$BIN" .
+            GO_RC=$?
+            echo "go build exit: $GO_RC"
+            if [ "$GO_RC" != "0" ]; then
+              echo "BUILD FAILED"
+              exit $GO_RC
+            fi
           fi
 
           ls -lh "$BIN"
@@ -166,7 +174,8 @@ jobs:
           fi
           set -e
 
-      - name: UPX compress
+      - name: UPX compress (amd64 only)
+        if: matrix.goarch == 'amd64'
         uses: crazy-max/ghaction-upx@v3
         with:
           version: latest
