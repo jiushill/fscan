@@ -4,7 +4,8 @@ on:
   workflow_dispatch:
 
 env:
-  GO_VERSION: "1.22"
+  GO_VERSION: "1.24"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
@@ -30,6 +31,10 @@ jobs:
             goarch: arm64
             bin_ext: ""
 
+    defaults:
+      run:
+        working-directory: fscan
+
     steps:
       - name: Checkout fscan source
         uses: actions/checkout@v4
@@ -42,65 +47,71 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: fscan/go.sum
 
-      - name: Install garble (Go obfuscator)
-        run: go install mvdan.cc/garble@latest
+      - name: Download Go modules
+        run: go mod download
 
       - name: Patch source — strip fscan fingerprints
+        shell: bash
         run: |
-          cd fscan
           python3 << 'PYEOF'
-          import os
+          import os, sys
 
-          def patch_file(path, replacements):
-              with open(path, "r", encoding="utf-8") as f:
+          def apply_patches(fname, replacements):
+              with open(fname, "r", encoding="utf-8", newline="") as f:
                   content = f.read()
+              orig = content
               for old, new in replacements:
-                  if old not in content:
-                      print(f"WARNING: pattern not found in {path}: {old[:60]}...")
-                  content = content.replace(old, new)
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(content)
+                  if old in content:
+                      content = content.replace(old, new)
+                      continue
+                  old_crlf = old.replace('\n', '\r\n')
+                  new_crlf = new.replace('\n', '\r\n')
+                  if old_crlf in content:
+                      content = content.replace(old_crlf, new_crlf)
+                      continue
+                  print(f"WARNING: pattern not found in {fname}")
+                  print(f"  {repr(old[:80])}")
+              if content != orig:
+                  with open(fname, "w", encoding="utf-8", newline="") as f:
+                      f.write(content)
+                  print(f"OK patched: {fname}")
+              else:
+                  print(f"SKIP (no change): {fname}")
 
-          # 1. Disable Banner() call in parseCommandLineArgs (common/flag.go)
-          patch_file("common/flag.go", [
+          apply_patches("common/flag.go", [
               ("\t// 显示Banner\n\tBanner()",
                "\t// Banner stripped for build\n"),
           ])
 
-          # 2. Replace default User-Agent fingerprint (common/flag_config.go)
-          patch_file("common/flag_config.go", [
+          apply_patches("common/flag_config.go", [
               ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                'curl/7.68.0'),
           ])
 
-          # 3. Strip debug/pprof import from main_cli.go
-          patch_file("main_cli.go", [
+          apply_patches("main_cli.go", [
               ('\t"github.com/shadow1ng/fscan/common/debug"\n', ""),
               ('\tdebug.Start()\n', ""),
               ('\tdefer debug.Stop()\n', ""),
           ])
 
-          print("Source patching complete.")
+          print("Source patching done.")
           PYEOF
 
-      - name: Build with garble (obfuscated Go binary)
+      - name: Build binary (stripped)
         run: |
-          mkdir -p output
-          cd fscan
-          CGO_ENABLED=0 \
-          GOOS=${{ matrix.goos }} \
-          GOARCH=${{ matrix.goarch }} \
-          garble \
-            -tiny \
-            -literals \
-            -seed=random \
-            build \
-            -ldflags="-s -w -X 'github.com/shadow1ng/fscan/common.version=1.0' -X 'github.com/shadow1ng/fscan/common.commit=00000000' -X 'github.com/shadow1ng/fscan/common.date=1970-01-01'" \
-            -trimpath \
-            -buildvcs=false \
-            -o ../output/network_tool${{ matrix.bin_ext }} \
-            .
+          mkdir -p ../output
+          BIN="../output/network_tool${{ matrix.bin_ext }}"
+          LDFLAGS="-s -w -X github.com/shadow1ng/fscan/common.version=1.0 -X github.com/shadow1ng/fscan/common.commit=00000000 -X github.com/shadow1ng/fscan/common.date=1970-01-01"
+
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -ldflags="$LDFLAGS" -trimpath -buildvcs=false \
+            -o "$BIN" .
+
+          echo "=== Binary ==="
+          ls -lh "$BIN"
+          file "$BIN" || true
 
       - name: UPX compress
         uses: crazy-max/ghaction-upx@v3
@@ -112,12 +123,13 @@ jobs:
 
       - name: Rename with platform suffix
         run: |
-          mv output/network_tool${{ matrix.bin_ext }} output/network_tool-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.bin_ext }}
+          mv "../output/network_tool${{ matrix.bin_ext }}" \
+             "../output/network_tool-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.bin_ext }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fscan-files-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: network_tool-${{ matrix.goos }}-${{ matrix.goarch }}
           path: output/network_tool-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.bin_ext }}
           if-no-files-found: error
           retention-days: 7
@@ -129,7 +141,6 @@ jobs:
     steps:
       - name: Done
         run: |
-          echo "========================================="
-          echo "  All fscan builds completed."
-          echo "  Check 'Artifacts' section to download."
-          echo "========================================="
+          echo "================================================="
+          echo "  Build complete. Download from Artifacts."
+          echo "================================================="
