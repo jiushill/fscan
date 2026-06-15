@@ -43,6 +43,9 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: fscan/go.sum
 
+      - name: Verify Go version
+        run: go version
+
       - name: Download Go modules
         run: go mod download
 
@@ -50,7 +53,7 @@ jobs:
         shell: bash
         run: |
           python3 << 'PYEOF'
-          import os, sys
+          import os, sys, fnmatch
 
           def apply_patches(fname, replacements):
               with open(fname, "r", encoding="utf-8", newline="") as f:
@@ -74,23 +77,42 @@ jobs:
               else:
                   print(f"SKIP (no change): {fname}")
 
+          # 0. Rename module path across entire project
+          OLD_MOD = "github.com/shadow1ng/fscan"
+          NEW_MOD = "github.com/net/tools"
+
+          for root, dirs, files in os.walk("."):
+              for fname in files:
+                  if fname.endswith(".go") or fname == "go.mod":
+                      fpath = os.path.join(root, fname)
+                      with open(fpath, "r", encoding="utf-8", newline="") as f:
+                          content = f.read()
+                      if OLD_MOD in content:
+                          content = content.replace(OLD_MOD, NEW_MOD)
+                          with open(fpath, "w", encoding="utf-8", newline="") as f:
+                              f.write(content)
+          print(f"Module renamed: {OLD_MOD} -> {NEW_MOD}")
+
+          # 1. Disable Banner() call (common/flag.go)
           apply_patches("common/flag.go", [
               ("\t// 显示Banner\n\tBanner()",
                "\t// Banner stripped for build\n"),
           ])
 
+          # 2. Replace default User-Agent (common/flag_config.go)
           apply_patches("common/flag_config.go", [
               ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                'curl/7.68.0'),
           ])
 
+          # 3. Strip debug/pprof import (main_cli.go)
           apply_patches("main_cli.go", [
-              ('\t"github.com/shadow1ng/fscan/common/debug"\n', ""),
+              (f'\t"{NEW_MOD}/common/debug"\n', ""),
               ('\tdebug.Start()\n', ""),
               ('\tdefer debug.Stop()\n', ""),
           ])
 
-          # 4. Fix SA2001 empty critical section in state_test.go
+          # 4. Fix SA2001 empty critical section (common/state_test.go)
           apply_patches("common/state_test.go", [
               ("\tmu.Lock()\n\tmu.Unlock()",
                "\tmu.Lock()\n\t_ = mu // test mutex\n\tmu.Unlock()"),
@@ -99,19 +121,48 @@ jobs:
           print("Source patching done.")
           PYEOF
 
-      - name: Build binary (stripped)
+      - name: Install garble (pinned version for Go 1.24)
+        run: |
+          go install mvdan.cc/garble@v0.14.0
+          GARBLE="$(go env GOPATH)/bin/garble"
+          "$GARBLE" version 2>/dev/null && echo "garble OK" || echo "garble NOT FOUND"
+
+      - name: Build binary
         run: |
           mkdir -p ../output
+          GARBLE="$(go env GOPATH)/bin/garble"
           BIN="../output/network_tool${{ matrix.bin_ext }}"
-          LDFLAGS="-s -w -X github.com/shadow1ng/fscan/common.version=1.0 -X github.com/shadow1ng/fscan/common.commit=00000000 -X github.com/shadow1ng/fscan/common.date=1970-01-01"
+          LDFLAGS="-s -w -X github.com/net/tools/common.version=1.0 -X github.com/net/tools/common.commit=00000000 -X github.com/net/tools/common.date=1970-01-01"
 
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags="$LDFLAGS" -trimpath -buildvcs=false \
-            -o "$BIN" .
+          if [ -x "$GARBLE" ]; then
+            echo "=== garble ==="
+            GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+              "$GARBLE" -tiny -literals -seed=random \
+              build -ldflags="$LDFLAGS" -trimpath -buildvcs=false \
+              -o "$BIN" . 2>&1 || echo "GARBLE_FAILED"
+          fi
 
-          echo "=== Binary ==="
+          if [ ! -f "$BIN" ]; then
+            echo "=== fallback go build ==="
+            GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+              go build -ldflags="$LDFLAGS" -trimpath -buildvcs=false \
+              -gcflags="all=-spectre=index" \
+              -o "$BIN" .
+          fi
+
           ls -lh "$BIN"
           file "$BIN" || true
+
+      - name: Strip Go build ID/note sections
+        shell: bash
+        run: |
+          BIN="../output/network_tool${{ matrix.bin_ext }}"
+          go tool buildid -w "$BIN" 2>/dev/null || true
+
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            strip -R .note.go.buildid "$BIN" 2>/dev/null || true
+            strip -R .note.gnu.build-id "$BIN" 2>/dev/null || true
+          fi
 
       - name: UPX compress
         uses: crazy-max/ghaction-upx@v3
@@ -157,18 +208,15 @@ jobs:
           tag_name: nightly
           name: "Nightly Build"
           body: |
-            Automated nightly build of fscan (obfuscated).
+            Automated nightly build (obfuscated).
 
-            **Modifications:**
-            - Banner removed
-            - Default User-Agent changed
-            - Debug/pprof stripped
-            - DWARF symbols stripped (-ldflags="-s -w")
-            - Path info removed (-trimpath)
-            - VCS info removed (-buildvcs=false)
-            - UPX compressed
-
-            Built from [shadow1ng/fscan](https://github.com/shadow1ng/fscan) main branch.
+            - Module path renamed
+            - Banner / debug / UA stripped
+            - garble obfuscation (-tiny -literals)
+            - DWARF + symbol table stripped (-s -w)
+            - trimpath + buildvcs=false
+            - Go build ID removed
+            - UPX packed (--best --lzma)
           prerelease: true
           make_latest: true
           files: |
