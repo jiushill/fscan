@@ -24,12 +24,6 @@ jobs:
           - goos: linux
             goarch: arm64
             bin_ext: ""
-          - goos: darwin
-            goarch: amd64
-            bin_ext: ""
-          - goos: darwin
-            goarch: arm64
-            bin_ext: ""
 
     defaults:
       run:
